@@ -1,7 +1,7 @@
 import json
 import os
 from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import uvicorn
 from fastapi import Depends, FastAPI
@@ -11,66 +11,125 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from starlette.routing import Mount
 
-
+from mcpo.utils import PatchedClientSession
+from mcpo.utils.common_logging import logger
 from mcpo.utils.main import get_model_fields, get_tool_handler
 from mcpo.utils.auth import get_verify_api_key, APIKeyMiddleware
 
+def safe_json_dumps(obj: Any) -> str:
+    """Safely serialize an object to JSON, handling non-serializable types."""
+    if obj is None:
+        return "null"
+    try:
+        return json.dumps(obj, indent=2)
+    except (TypeError, ValueError):
+        # If serialization fails, return a string representation
+        return str(obj)
+
+def get_schema_defs(schema: Any) -> Dict[str, Any]:
+    """Extract schema definitions from a schema object."""
+    if schema is None:
+        return {}
+
+    # If schema is a method, call it to get the actual schema
+    if callable(schema):
+        try:
+            schema = schema()
+        except Exception as e:
+            logger.warning(f"Failed to call schema method: {e}")
+            return {}
+
+    # If schema is a dictionary, extract definitions
+    if isinstance(schema, dict):
+        defs = {}
+        defs.update(schema.get("$defs", {}))
+        defs.update(schema.get("definitions", {}))
+        return defs
+
+    return {}
 
 async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
     session: ClientSession = app.state.session
     if not session:
         raise ValueError("Session is not initialized in the app state.")
 
-    result = await session.initialize()
-    server_info = getattr(result, "serverInfo", None)
-    if server_info:
-        app.title = server_info.name or app.title
-        app.description = (
-            f"{server_info.name} MCP Server" if server_info.name else app.description
-        )
-        app.version = server_info.version or app.version
-
-    tools_result = await session.list_tools()
-    tools = tools_result.tools
-
-    for tool in tools:
-        endpoint_name = tool.name
-        endpoint_description = tool.description
-
-        inputSchema = tool.inputSchema
-        outputSchema = getattr(tool, "outputSchema", None)
-
-        form_model_fields = get_model_fields(
-            f"{endpoint_name}_form_model",
-            inputSchema.get("properties", {}),
-            inputSchema.get("required", []),
-            inputSchema.get("$defs", {}),
-        )
-
-        response_model_fields = None
-        if outputSchema:
-            response_model_fields = get_model_fields(
-                f"{endpoint_name}_response_model",
-                outputSchema.get("properties", {}),
-                outputSchema.get("required", []),
-                outputSchema.get("$defs", {}),
+    try:
+        result = await session.initialize()
+        server_info = getattr(result, "serverInfo", None)
+        if server_info:
+            app.title = server_info.name or app.title
+            app.description = (
+                f"{server_info.name} MCP Server" if server_info.name else app.description
             )
+            app.version = server_info.version or app.version
 
-        tool_handler = get_tool_handler(
-            session,
-            endpoint_name,
-            form_model_fields,
-            response_model_fields,
-        )
+        tools_result = await session.list_tools()
+        tools = getattr(tools_result, "tools", [])
 
-        app.post(
-            f"/{endpoint_name}",
-            summary=endpoint_name.replace("_", " ").title(),
-            description=endpoint_description,
-            response_model_exclude_none=True,
-            dependencies=[Depends(api_dependency)] if api_dependency else [],
-        )(tool_handler)
+        for tool in tools:
+            endpoint_name = tool.name
+            endpoint_description = tool.description
 
+            inputSchema = tool.inputSchema
+            outputSchema = getattr(tool, "outputSchema", None)
+
+            # Debug logging
+            logger.info(f"Processing tool: {endpoint_name}")
+            logger.debug(f"Input schema: {safe_json_dumps(inputSchema)}")
+            logger.debug(f"Output schema: {safe_json_dumps(outputSchema)}")
+            logger.debug(f"Root schema: {safe_json_dumps(tool.schema if hasattr(tool, 'schema') else None)}")
+
+            # Get schema definitions from both root and inputSchema
+            schema_defs = {}
+            if hasattr(tool, "schema"):
+                logger.debug("Merging schema definitions from root schema")
+                schema_defs.update(get_schema_defs(tool.schema))
+
+            logger.debug("Merging schema definitions from input schema")
+            schema_defs.update(get_schema_defs(inputSchema))
+
+            logger.debug(f"Final schema definitions: {safe_json_dumps(schema_defs)}")
+
+            try:
+                form_model_fields = get_model_fields(
+                    f"{endpoint_name}_form_model",
+                    inputSchema.get("properties", {}),
+                    inputSchema.get("required", []),
+                    schema_defs,
+                )
+
+                response_model_fields = None
+                if outputSchema:
+                    logger.debug("Processing output schema")
+                    response_model_fields = get_model_fields(
+                        f"{endpoint_name}_response_model",
+                        outputSchema.get("properties", {}),
+                        outputSchema.get("required", []),
+                        schema_defs,
+                    )
+
+                tool_handler, response_model = get_tool_handler(
+                    session,
+                    endpoint_name,
+                    form_model_fields,
+                    response_model_fields,
+                )
+
+                app.post(
+                    f"/{endpoint_name}",
+                    summary=endpoint_name.replace("_", " ").title(),
+                    description=endpoint_description,
+                    response_model=response_model,
+                    response_model_exclude_none=True,
+                    dependencies=[Depends(api_dependency)] if api_dependency else [],
+                )(tool_handler)
+                logger.info(f"Successfully created endpoint: {endpoint_name}")
+            except Exception as e:
+                logger.error(f"Error creating endpoint {endpoint_name}: {str(e)}", exc_info=True)
+                continue
+    except Exception as e:
+        logger.error(f"Error in create_dynamic_endpoints: {str(e)}", exc_info=True)
+        raise
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -102,7 +161,7 @@ async def lifespan(app: FastAPI):
             )
 
             async with stdio_client(server_params) as (reader, writer):
-                async with ClientSession(reader, writer) as session:
+                async with PatchedClientSession(reader, writer) as session:
                     app.state.session = session
                     await create_dynamic_endpoints(app, api_dependency=api_dependency)
                     yield
@@ -111,7 +170,7 @@ async def lifespan(app: FastAPI):
                 reader,
                 writer,
             ):
-                async with ClientSession(reader, writer) as session:
+                async with PatchedClientSession(reader, writer) as session:
                     app.state.session = session
                     await create_dynamic_endpoints(app, api_dependency=api_dependency)
                     yield
